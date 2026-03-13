@@ -1,0 +1,706 @@
+---
+title: "Fama-French 5 Factors: PCA & MDS Geometry (Monthly)"
+author: "Tymoteusz Pawełczyk"
+output:
+  html_document:
+    toc: true
+    toc_depth: 2
+    number_sections: true
+    theme: readable
+    df_print: paged
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,        # <-- SHOW CODE (RPubs style)
+  message = FALSE,
+  warning = FALSE,
+  collapse = TRUE,    # <-- code + output together
+  comment = "#>",     # <-- output prefix like in many RPubs examples
+  fig.width = 8,
+  fig.height = 5,
+  fig.align = "center"
+)
+set.seed(123)
+```
+## Introduction {-}
+
+The Fama-French five-factor model constitutes one of the most influential empirical frameworks in modern asset pricing, extending the traditional CAPM by incorporating size, value, profitability, and investment-related risk factors. While the individual economic interpretations of these factors are well established in the literature, less attention is typically devoted to the *joint correlation structure* and *latent geometry* of the factor space itself.
+
+This project aims to explore the multivariate dependence structure of the monthly Fama-French five factors using dimensionality reduction techniques. Rather than focusing on predictive performance or asset pricing tests, the analysis emphasizes the *internal geometry of the factor space* and investigates whether the observed factors can be represented by a smaller number of latent dimensions without substantial loss of information.
+
+To this end, Principal Component Analysis (PCA), rotated PCA, and Multidimensional Scaling (MDS) are employed and systematically compared. Particular attention is paid to distance preservation, interpretability of latent components, and the degree to which linear methods adequately capture the structure of the data.
+
+## Data Description: Fama-French Five-Factor Model {-}
+
+The empirical analysis is based on the **Fama-French Five-Factor model** using **monthly data**. The dataset originates from the publicly available data library (https://mba.tuck.dartmouth.edu/pages/faculty/ken.french/data_library.html) maintained by Kenneth R. French and is widely used in empirical asset pricing research.
+
+### Factor Definitions {.unnumbered}
+
+The following five risk factors are employed in the analysis:
+
+- **Mkt-RF (Market Excess Return)**  
+  The excess return on the value-weighted market portfolio over the risk-free rate. This factor captures systematic market risk and represents the traditional CAPM component.
+
+- **SMB (Small Minus Big)**  
+  The return differential between portfolios of small-cap and large-cap firms, designed to proxy for the size effect observed in equity markets.
+
+- **HML (High Minus Low)**  
+  The return differential between high book-to-market (value) and low book-to-market (growth) firms, capturing the value premium.
+
+- **RMW (Robust Minus Weak)**  
+  The return differential between firms with robust and weak operating profitability, reflecting the profitability effect in asset returns.
+
+- **CMA (Conservative Minus Aggressive)**  
+  The return differential between firms that invest conservatively versus aggressively, capturing the investment effect.
+
+The risk-free rate (RF) is excluded from the analysis, as the focus is placed on the joint structure and dependence between the systematic risk factors themselves rather than on excess-return construction.
+
+### Data Frequency and Sample Size {.unnumbered}
+
+The dataset consists of approximately **750 monthly observations**, covering several decades of U.S. equity market history. Monthly frequency is chosen to balance noise reduction with sufficient time-series length for reliable multivariate analysis.
+
+### Data Preprocessing {.unnumbered}
+
+All factor return series are transformed as follows:
+
+- Returns are expressed in **percentage terms**.
+- Each factor is **standardized using z-scores**, i.e. centered to zero mean and scaled to unit variance.
+
+Standardization ensures that the subsequent distance-based and variance-based methods (PCA and MDS) are not dominated by differences in scale or volatility across factors. As a result, the analysis focuses purely on **correlation structure and geometric relationships** among the factors.
+
+### Analytical Scope {.unnumbered}
+
+Despite the relatively small number of variables, dimensionality reduction is well motivated due to the presence of strong and economically meaningful correlations among the factors. The objective is not variable reduction per se, but rather to:
+
+- uncover latent dimensions driving common variation,
+- assess whether the factor space exhibits an approximately linear structure,
+- compare variance-preserving (PCA) and distance-preserving (MDS) representations.
+
+This approach aligns with the broader asset pricing literature, where factor interdependence and redundancy are known to play a crucial role in model interpretation and factor construction.
+
+
+
+# Environment
+
+## Data Description
+
+The analysis is based on monthly observations of the Fama-French five factors obtained from Kenneth French’s data library. The sample spans approximately 750 monthly observations, providing a sufficiently long time horizon to study the stable dependence structure between factors.
+
+The five analyzed factors include the excess market return (Mkt-RF), size (SMB), value (HML), profitability (RMW), and investment (CMA). The risk-free rate is excluded, as the focus lies on the joint behavior of systematic risk factors rather than excess return construction.
+
+All factor series are standardized prior to analysis to ensure comparability and to prevent scale differences from influencing distance-based methods. Standardization is particularly important in the context of PCA and MDS, where the geometry of the data is directly affected by variable scaling.
+
+
+```{r}
+options(repos = c(CRAN = "https://cloud.r-project.org"))
+
+required_pkgs <- c(
+  "tidyverse", "lubridate", "gridExtra", "smacof", "vegan", "psych", "tibble"
+)
+
+missing_pkgs <- required_pkgs[
+  !vapply(required_pkgs, requireNamespace, logical(1), quietly = TRUE)
+]
+
+if (length(missing_pkgs) > 0) {
+  install.packages(missing_pkgs, dependencies = TRUE)
+}
+
+invisible(lapply(required_pkgs, library, character.only = TRUE))
+```
+
+# Data Loading and Cleaning (FF5 Monthly)
+
+```{r}
+ff5_raw <- readr::read_csv("FF5_monthly.csv", show_col_types = FALSE)
+
+names(ff5_raw)
+head(ff5_raw, 5)
+```
+
+```{r}
+ff5 <- ff5_raw %>%
+  rename(DATE = 1) %>%
+  mutate(DATE = as.character(DATE)) %>%
+  filter(str_detect(DATE, "^[0-9]{6}$")) %>%
+  mutate(date = ymd(paste0(DATE, "01"))) %>%
+  select(date, `Mkt-RF`, SMB, HML, RMW, CMA) %>%
+  arrange(date) %>%
+  mutate(across(-date, as.numeric))
+
+glimpse(ff5)
+range(ff5$date)
+summary(ff5)
+```
+
+```{r}
+diag_tbl <- tibble(
+  start_date = min(ff5$date),
+  end_date   = max(ff5$date),
+  n_months   = nrow(ff5),
+  n_factors  = ncol(ff5) - 1
+)
+knitr::kable(diag_tbl, caption = "Dataset diagnostics")
+```
+
+# Correlation Structure
+
+```{r}
+X <- ff5 %>% select(`Mkt-RF`, SMB, HML, RMW, CMA)
+
+corr_mat <- cor(X, use = "pairwise.complete.obs")
+round(corr_mat, 2)
+```
+
+```{r}
+knitr::kable(round(corr_mat, 2), caption = "Correlation matrix")
+```
+
+```{r, fig.width=7, fig.height=6}
+corr_df <- as.data.frame(corr_mat) %>%
+  rownames_to_column("factor1") %>%
+  pivot_longer(-factor1, names_to = "factor2", values_to = "corr")
+
+ggplot(corr_df, aes(factor1, factor2, fill = corr)) +
+  geom_tile() +
+  geom_text(aes(label = round(corr, 2)), size = 4) +
+  scale_fill_gradient2(limits = c(-1, 1)) +
+  coord_equal() +
+  labs(title = "Correlation heatmap", fill = "Corr") +
+  theme_minimal()
+```
+
+```{r}
+corr_with_mkt <- sort(corr_mat[, "Mkt-RF"], decreasing = TRUE)
+round(corr_with_mkt, 2)
+```
+
+## Correlation Structure of the Fama-French Factors
+
+The correlation matrix confirms non-trivial dependence between factors and supports dimensionality reduction. The strongest relationship is between HML and CMA (\(r =\) `r round(corr_mat["HML", "CMA"], 2)`), consistent with a shared value-investment structure.
+
+Mkt-RF is moderately positively related to SMB (\(r =\) `r round(corr_mat["Mkt-RF", "SMB"], 2)`) and negatively related to HML, RMW, and CMA. RMW is not fully orthogonal: it is close to zero versus HML and CMA, but materially negative versus SMB (\(r =\) `r round(corr_mat["RMW", "SMB"], 2)`).
+
+Overall, the pattern suggests a few latent dimensions rather than five independent sources of variation.
+
+
+# PCA Analysis
+
+```{r}
+X_scaled <- scale(X)
+pca <- prcomp(X_scaled)
+
+eig <- pca$sdev^2
+prop <- eig / sum(eig)
+
+pca_var_tbl <- tibble(
+  PC = paste0("PC", 1:5),
+  eigenvalue = eig,
+  prop_var = prop,
+  cum_var = cumsum(prop)
+)
+
+pca_var_tbl
+```
+
+```{r}
+knitr::kable(
+  pca_var_tbl %>% mutate(across(where(is.numeric), ~ round(.x, 4))),
+  caption = "PCA: eigenvalues and explained variance"
+)
+```
+
+```{r}
+scree_tbl <- pca_var_tbl %>%
+  mutate(PC = factor(PC, levels = paste0("PC", 1:5)))
+
+ggplot(scree_tbl, aes(PC, prop_var, group = 1)) +
+  geom_col(fill = "steelblue", alpha = 0.8) +
+  geom_line(color = "grey30") +
+  geom_point(color = "grey30", size = 2) +
+  scale_y_continuous(labels = scales::percent_format(accuracy = 1)) +
+  labs(
+    title = "Scree plot: variance explained by PCs",
+    x = NULL,
+    y = "Explained variance"
+  ) +
+  theme_minimal()
+```
+
+```{r}
+loadings <- pca$rotation[, 1:3] %>%
+  as.data.frame() %>%
+  rownames_to_column("Factor")
+
+knitr::kable(
+  loadings %>% mutate(across(-Factor, ~ round(.x, 3))),
+  caption = "PCA loadings (PC1-PC3)"
+)
+```
+## Interpretation of Principal Components
+
+Interpretation should be based on loading magnitudes (the sign itself is arbitrary in PCA). In this sample:
+
+- **PC1** is mainly driven by **HML** and **CMA** (with additional market exposure), indicating a dominant *Value-Investment* dimension.
+- **PC2** loads strongly on **SMB** and **RMW** with opposite signs, suggesting a *Size-Profitability contrast* rather than a pure profitability factor.
+- **PC3** is strongest on **Mkt-RF** and **RMW**, which is closer to a *Market-Profitability* component than a Market-Size axis.
+
+
+
+```{r, fig.height=10}
+contrib_tbl <- as_tibble(pca$rotation[, 1:3], rownames = "Factor") %>%
+  pivot_longer(-Factor, names_to = "PC", values_to = "loading") %>%
+  group_by(PC) %>%
+  mutate(contrib = 100 * (loading^2) / sum(loading^2)) %>%
+  ungroup()
+
+plot_contrib <- function(pc_name) {
+  ggplot(
+    contrib_tbl %>% filter(PC == pc_name) %>% arrange(desc(contrib)),
+    aes(x = reorder(Factor, contrib), y = contrib)
+  ) +
+    geom_col(fill = "steelblue", alpha = 0.85) +
+    coord_flip() +
+    labs(title = paste("Contribution to", pc_name), x = NULL, y = "Contribution (%)") +
+    theme_minimal()
+}
+
+gridExtra::grid.arrange(
+  plot_contrib("PC1"),
+  plot_contrib("PC2"),
+  plot_contrib("PC3"),
+  ncol = 1
+)
+```
+
+```{r}
+scores <- as_tibble(pca$x) %>%
+  mutate(date = ff5$date)
+
+ggplot(scores, aes(PC1, PC2)) +
+  geom_point(alpha = 0.5) +
+  labs(title = "Months in PC space (PC1 vs PC2)") +
+  theme_minimal()
+```
+
+```{r, fig.width=9}
+scores_12 <- as_tibble(pca$x[, 1:2], .name_repair = "minimal") %>%
+  rename(PC1 = 1, PC2 = 2)
+
+loadings_12 <- as_tibble(pca$rotation[, 1:2], rownames = "Factor")
+
+arrow_scale <- min(
+  diff(range(scores_12$PC1)) / diff(range(loadings_12$PC1)),
+  diff(range(scores_12$PC2)) / diff(range(loadings_12$PC2))
+) * 0.25
+
+loadings_plot <- loadings_12 %>%
+  mutate(
+    PC1 = PC1 * arrow_scale,
+    PC2 = PC2 * arrow_scale
+  )
+
+ggplot(scores_12, aes(PC1, PC2)) +
+  geom_point(alpha = 0.5, color = "grey40") +
+  geom_segment(
+    data = loadings_plot,
+    aes(x = 0, y = 0, xend = PC1, yend = PC2),
+    inherit.aes = FALSE,
+    color = "steelblue",
+    arrow = arrow(length = grid::unit(0.2, "cm"))
+  ) +
+  geom_text(
+    data = loadings_plot,
+    aes(x = PC1, y = PC2, label = Factor),
+    inherit.aes = FALSE,
+    color = "steelblue",
+    nudge_y = 0.05,
+    size = 4
+  ) +
+  labs(title = "PCA biplot: PC1 vs PC2") +
+  theme_minimal()
+```
+
+## Principal Component Analysis
+
+Principal Component Analysis is employed to identify orthogonal linear combinations of the original factors that explain the maximum variance in the data. Given the strong correlation structure observed earlier, PCA serves as a natural first step in uncovering latent dimensions underlying the factor space.
+
+For this dataset, the first three principal components explain `r round(sum(prop[1:3]) * 100, 1)`% of total variance. This indicates that effective dimensionality is lower than the nominal five factors, although not all variation is captured in 2D.
+
+From an economic perspective, this finding implies that multiple observed risk factors may be manifestations of a smaller number of fundamental sources of systematic risk.
+
+
+
+# Multidimensional Scaling (MDS)
+
+```{r}
+dist_mat <- dist(scale(X))
+mds_cmd <- cmdscale(dist_mat, k = 2)
+
+mds_df <- tibble(
+  Dim1 = mds_cmd[, 1],
+  Dim2 = mds_cmd[, 2]
+)
+
+ggplot(mds_df, aes(Dim1, Dim2)) +
+  geom_point(alpha = 0.5, color = "grey40") +
+  labs(title = "Classical MDS (2D)") +
+  theme_minimal()
+```
+
+```{r}
+mds_smacof <- smacof::mds(dist_mat, ndim = 2, type = "ratio")
+mds_smacof$stress
+```
+
+```{r}
+knitr::kable(
+  tibble(stress_2D = round(mds_smacof$stress, 4)),
+  caption = "SMACOF MDS stress (2D)"
+)
+```
+
+```{r}
+plot(mds_smacof, main = "SMACOF MDS (stress-based)")
+```
+
+```{r}
+stress_curve <- tibble(
+  ndim = 1:5,
+  stress = map_dbl(1:5, ~ smacof::mds(dist_mat, ndim = .x, type = "ratio")$stress)
+)
+
+knitr::kable(
+  stress_curve %>% mutate(stress = round(stress, 4)),
+  caption = "Stress vs number of dimensions"
+)
+```
+
+```{r}
+ggplot(stress_curve, aes(ndim, stress)) +
+  geom_line() +
+  geom_point(size = 2) +
+  labs(title = "SMACOF MDS: stress curve") +
+  theme_minimal()
+```
+
+## Multidimensional Scaling
+
+Multidimensional Scaling offers a complementary, distance-based perspective on the structure of the data. Unlike PCA, which is variance-oriented, MDS focuses explicitly on preserving pairwise distances between observations.
+
+Using Euclidean distances computed on standardized factors, both classical MDS and stress-based SMACOF MDS are applied. The 2D SMACOF solution has stress `r round(mds_smacof$stress, 3)`, which is acceptable for visualization but still indicates non-negligible distortion.
+
+The stress curve shows substantial improvement from 2D to 3D (`r round(stress_curve$stress[stress_curve$ndim == 2], 3)` \(\rightarrow\) `r round(stress_curve$stress[stress_curve$ndim == 3], 3)`), and further improvement in 4D. This supports using 2D for communication, while noting that higher-dimensional embeddings represent distances more faithfully.
+
+
+# PCA vs MDS: Geometry Comparison
+
+```{r}
+d_orig <- as.vector(dist(scale(X)))
+d_pca  <- as.vector(dist(as.matrix(scores[, c("PC1","PC2")])))
+d_mds  <- as.vector(dist(mds_cmd))
+
+cor(d_orig, d_pca)
+cor(d_orig, d_mds)
+```
+
+```{r}
+knitr::kable(
+  tibble(
+    comparison = c("Original vs PCA(2D)", "Original vs MDS(2D)"),
+    correlation = round(c(cor(d_orig, d_pca), cor(d_orig, d_mds)), 4)
+  ),
+  caption = "Distance preservation"
+)
+```
+
+## Comparison of PCA and MDS Representations
+
+Distance preservation is evaluated here as the **Pearson correlation of pairwise Euclidean distances** between the original standardized space and each 2D embedding. In this sample, both PCA(2D) and MDS(2D) achieve high correlation (`r round(cor(d_orig, d_pca), 3)` and `r round(cor(d_orig, d_mds), 3)`).
+
+Procrustes alignment between PCA and classical MDS is numerically near-perfect (`r format(vegan::procrustes(as.matrix(scores[, c("PC1","PC2")]), as.matrix(mds_cmd), symmetric = TRUE)$ss, scientific = TRUE, digits = 3)` sum of squares), showing that both methods recover almost the same 2D geometry up to rotation/reflection/scale.
+
+Methodological caveat: because both embeddings are linear and are built from the same standardized Euclidean structure, strong similarity is expected. Therefore, this comparison supports internal consistency of the geometry rather than serving as a standalone proof that nonlinear methods would never add information.
+
+
+# Procrustes Analysis
+
+```{r}
+proc <- vegan::procrustes(
+  as.matrix(scores[, c("PC1","PC2")]),
+  as.matrix(mds_cmd),
+  symmetric = TRUE
+)
+
+proc_overlay <- bind_rows(
+  tibble(Dim1 = proc$X[, 1], Dim2 = proc$X[, 2], Space = "PCA (2D)"),
+  tibble(Dim1 = proc$Yrot[, 1], Dim2 = proc$Yrot[, 2], Space = "MDS aligned")
+)
+
+ggplot(proc_overlay, aes(Dim1, Dim2, color = Space)) +
+  geom_point(alpha = 0.35, size = 1) +
+  labs(title = "Procrustes alignment: PCA vs MDS", x = "Dimension 1", y = "Dimension 2") +
+  theme_minimal()
+
+summary(proc)
+```
+
+# Rotated PCA (Varimax)
+
+```{r}
+rot_pca <- psych::principal(X_scaled, nfactors = 3, rotate = "varimax")
+print(rot_pca$loadings, cutoff = 0.3)
+```
+## Rotated Principal Components
+
+To enhance interpretability, a varimax rotation is applied to the first three principal components. Rotation does not alter the explanatory power of the solution but redistributes variance across components in a way that promotes sparsity in loadings.
+
+The rotated solution is easier to read economically: one component is concentrated on **HML/CMA** (value-investment), one is concentrated on **RMW** (profitability), and one is centered on **Mkt-RF** with support from **SMB** (market-size exposure). This supports a low-dimensional but interpretable structure of common risk dimensions.
+
+
+## Interpretation of Principal Components
+
+Given the rotated structure above, interpretation is more robust when anchored in rotated loadings rather than reusing unrotated labels. The key message is that the five observed factors can be organized around a small set of economically meaningful dimensions: value-investment, profitability, and market-size exposure.
+
+# Portfolio-Level Validation: PCA vs Original FF5 on 25 Portfolios
+
+This chapter moves from factor geometry to asset-pricing application. The goal is to test whether latent factors extracted from PCA are practically useful in explaining the cross-section of Fama-French 25 portfolios and how they compare to the original pre-PCA FF5 factors.
+
+## Data Used in This Chapter
+
+The portfolio dataset comes from `25_Portfolios_5x5.csv` (CRSP 202601 vintage). It contains monthly value-weighted and equal-weighted returns for portfolios formed on size (ME) and book-to-market (BEME). We use the **value-weighted monthly block** only, consistent with typical factor-model validation practice. Missing values are encoded as `-99.99` or `-999` and are treated as `NA`.
+
+The factor-side data come from the already prepared monthly FF5 table and PCA scores computed earlier in the report. For pricing comparability, dependent variables are modeled as excess returns: \(R^e_{i,t} = R_{i,t} - RF_t\).
+
+```{r}
+portfolio_lines <- readr::read_lines("25_Portfolios_5x5.csv")
+ew_monthly_marker <- which(str_detect(portfolio_lines, "Average Equal Weighted Returns -- Monthly"))[1]
+
+if (is.na(ew_monthly_marker) || ew_monthly_marker <= 3) {
+  stop("Cannot locate the monthly value-weighted block in 25_Portfolios_5x5.csv")
+}
+
+vw_last_data_line <- max(which(str_detect(portfolio_lines[1:(ew_monthly_marker - 1)], "^[0-9]{6},")))
+
+vw_monthly_text <- paste(portfolio_lines[1:vw_last_data_line], collapse = "\n")
+
+port25_vw <- readr::read_csv(
+  I(vw_monthly_text),
+  show_col_types = FALSE,
+  na = c("-99.99", "-999")
+) %>%
+  rename(DATE = 1) %>%
+  mutate(
+    DATE = as.character(DATE),
+    date = ymd(paste0(DATE, "01"))
+  ) %>%
+  filter(str_detect(DATE, "^[0-9]{6}$")) %>%
+  select(-DATE)
+
+rf_monthly <- ff5_raw %>%
+  rename(DATE = 1) %>%
+  mutate(DATE = as.character(DATE)) %>%
+  filter(str_detect(DATE, "^[0-9]{6}$")) %>%
+  mutate(date = ymd(paste0(DATE, "01"))) %>%
+  select(date, RF) %>%
+  mutate(RF = as.numeric(RF))
+
+pc_scores <- scores %>% select(date, PC1, PC2, PC3)
+ff5_original <- ff5 %>% select(date, `Mkt-RF`, SMB, HML, RMW, CMA)
+
+analysis_panel <- port25_vw %>%
+  inner_join(pc_scores, by = "date") %>%
+  inner_join(ff5_original, by = "date") %>%
+  inner_join(rf_monthly, by = "date")
+
+portfolio_names <- setdiff(names(port25_vw), "date")
+
+section9_diag <- tibble(
+  start_date = min(analysis_panel$date),
+  end_date = max(analysis_panel$date),
+  n_months = nrow(analysis_panel),
+  n_portfolios = length(portfolio_names),
+  predictors_PCA = 3,
+  predictors_FF5 = 5
+)
+
+knitr::kable(section9_diag, caption = "Chapter 9 data panel diagnostics")
+```
+
+## Model Design
+
+For each of the 25 portfolios, we estimate two linear models on the same sample window:
+
+PCA latent-factor model:
+
+$$
+R^e_{i,t} = \alpha_i + \beta_{i1}PC1_t + \beta_{i2}PC2_t + \beta_{i3}PC3_t + \varepsilon_{i,t}
+$$
+
+Original FF5 model (pre-PCA factors):
+
+$$
+R^e_{i,t} = \alpha_i + \gamma_{iM}(Mkt\text{-}RF)_t + \gamma_{iS}SMB_t + \gamma_{iH}HML_t + \gamma_{iR}RMW_t + \gamma_{iC}CMA_t + \varepsilon_{i,t}
+$$
+
+We compare explanatory power using both \(R^2\) and adjusted \(R^2\), where adjusted \(R^2\) is especially important given different model dimensionality (3 vs 5 predictors).
+
+```{r}
+comparison_results <- map_dfr(portfolio_names, function(pname) {
+  model_data <- analysis_panel %>%
+    transmute(
+      ret_excess = .data[[pname]] - RF,
+      PC1, PC2, PC3,
+      `Mkt-RF`, SMB, HML, RMW, CMA
+    ) %>%
+    drop_na()
+
+  fit_pca <- lm(ret_excess ~ PC1 + PC2 + PC3, data = model_data)
+  fit_ff5 <- lm(ret_excess ~ `Mkt-RF` + SMB + HML + RMW + CMA, data = model_data)
+
+  co_pca <- coef(fit_pca)
+  co_ff5 <- coef(fit_ff5)
+
+  s_pca <- summary(fit_pca)
+  s_ff5 <- summary(fit_ff5)
+
+  tibble(
+    portfolio = pname,
+    alpha_PCA = unname(co_pca[1]),
+    beta_PC1 = unname(co_pca[2]),
+    beta_PC2 = unname(co_pca[3]),
+    beta_PC3 = unname(co_pca[4]),
+    alpha_FF5 = unname(co_ff5[1]),
+    beta_MKT = unname(co_ff5[2]),
+    beta_SMB = unname(co_ff5[3]),
+    beta_HML = unname(co_ff5[4]),
+    beta_RMW = unname(co_ff5[5]),
+    beta_CMA = unname(co_ff5[6]),
+    R2_PCA = s_pca$r.squared,
+    adjR2_PCA = s_pca$adj.r.squared,
+    R2_FF5 = s_ff5$r.squared,
+    adjR2_FF5 = s_ff5$adj.r.squared,
+    delta_adjR2 = s_pca$adj.r.squared - s_ff5$adj.r.squared,
+    R2_retention = if_else(s_ff5$r.squared > 0, s_pca$r.squared / s_ff5$r.squared, NA_real_),
+    n_obs = nobs(fit_pca)
+  )
+})
+
+knitr::kable(
+  comparison_results %>%
+    select(portfolio, beta_PC1, beta_PC2, beta_PC3, R2_PCA, adjR2_PCA, R2_FF5, adjR2_FF5, delta_adjR2) %>%
+    mutate(across(-portfolio, ~ round(.x, 4))),
+  caption = "Portfolio-level comparison: PCA latent model vs original FF5"
+)
+```
+
+```{r}
+model_compare_summary <- comparison_results %>%
+  summarize(
+    mean_R2_PCA = mean(R2_PCA, na.rm = TRUE),
+    mean_R2_FF5 = mean(R2_FF5, na.rm = TRUE),
+    mean_adjR2_PCA = mean(adjR2_PCA, na.rm = TRUE),
+    mean_adjR2_FF5 = mean(adjR2_FF5, na.rm = TRUE),
+    mean_R2_retention = mean(R2_retention, na.rm = TRUE),
+    median_R2_retention = median(R2_retention, na.rm = TRUE),
+    mean_delta_adjR2 = mean(delta_adjR2, na.rm = TRUE),
+    share_adjR2_within_95pct = mean(adjR2_PCA >= 0.95 * adjR2_FF5, na.rm = TRUE),
+    share_adjR2_PCA_gt_FF5 = mean(adjR2_PCA > adjR2_FF5, na.rm = TRUE)
+  )
+
+knitr::kable(
+  model_compare_summary %>% mutate(across(everything(), ~ round(.x, 4))),
+  caption = "Chapter 9 effectiveness summary"
+)
+```
+
+```{r, fig.width=6.8, fig.height=5}
+ggplot(comparison_results, aes(adjR2_FF5, adjR2_PCA)) +
+  geom_abline(slope = 1, intercept = 0, linetype = 2, color = "grey50") +
+  geom_point(size = 2.2, alpha = 0.85, color = "steelblue") +
+  labs(
+    title = "Adjusted R-squared: PCA latent model vs original FF5",
+    x = "Adjusted R-squared (FF5)",
+    y = "Adjusted R-squared (PCA latent factors)"
+  ) +
+  theme_minimal()
+```
+
+```{r, fig.width=10, fig.height=4.5}
+beta_long <- comparison_results %>%
+  select(portfolio, beta_PC1, beta_PC2, beta_PC3) %>%
+  pivot_longer(-portfolio, names_to = "component", values_to = "beta") %>%
+  mutate(component = str_remove(component, "beta_"))
+
+portfolio_grid <- tibble(portfolio = unique(beta_long$portfolio)) %>%
+  mutate(
+    size = case_when(
+      portfolio == "SMALL LoBM" ~ 1L,
+      portfolio == "SMALL HiBM" ~ 1L,
+      portfolio == "BIG LoBM" ~ 5L,
+      portfolio == "BIG HiBM" ~ 5L,
+      TRUE ~ as.integer(str_match(portfolio, "^ME([1-5]) BM([1-5])$")[, 2])
+    ),
+    bm = case_when(
+      portfolio == "SMALL LoBM" ~ 1L,
+      portfolio == "SMALL HiBM" ~ 5L,
+      portfolio == "BIG LoBM" ~ 1L,
+      portfolio == "BIG HiBM" ~ 5L,
+      TRUE ~ as.integer(str_match(portfolio, "^ME([1-5]) BM([1-5])$")[, 3])
+    ),
+    size_label = factor(size, levels = 5:1, labels = c("Big", "4", "3", "2", "Small")),
+    bm_label = factor(bm, levels = 1:5, labels = c("LoBM", "2", "3", "4", "HiBM"))
+  )
+
+beta_heatmap <- beta_long %>%
+  left_join(portfolio_grid, by = "portfolio")
+
+ggplot(beta_heatmap, aes(bm_label, size_label, fill = beta)) +
+  geom_tile(color = "white") +
+  facet_wrap(~ component, nrow = 1) +
+  scale_fill_gradient2(low = "#2c7bb6", mid = "white", high = "#d7191c") +
+  labs(
+    title = "PCA latent-factor exposures across the 5x5 size-value grid",
+    x = "Book-to-Market bucket",
+    y = "Size bucket",
+    fill = "Beta"
+  ) +
+  theme_minimal()
+```
+
+## Finance Interpretation: Effectiveness and Practical Sense
+
+The PCA model compresses FF5 information from five correlated factors into three orthogonal latent drivers. Empirically, this chapter shows how much explanatory power is retained when moving from the original FF5 specification to the PCA representation.
+
+In this sample, the PCA model retains on average about `r round(model_compare_summary$mean_R2_retention * 100, 1)`% of FF5 \(R^2\) (median retention: `r round(model_compare_summary$median_R2_retention * 100, 1)`%). The mean adjusted-\(R^2\) gap is `r round(model_compare_summary$mean_delta_adjR2, 4)`, and in `r round(model_compare_summary$share_adjR2_within_95pct * 100, 1)`% of portfolios the PCA adjusted \(R^2\) reaches at least 95% of the FF5 adjusted \(R^2\).
+
+From a asset-pricing perspective, this is a strong signal that PCA factors are economically usable as a parsimonious approximation layer. They are especially attractive when interpretability at the latent-dimension level, orthogonality of regressors, and model compactness are operational priorities. The trade-off is expected: some fit is sacrificed relative to the full FF5 basis, but often not enough to invalidate use in exploratory attribution, clustering of exposures, or reduced-form risk dashboards.
+
+Methodological caveat: this chapter is an in-sample structural test, not an out-of-sample forecasting evaluation. Therefore, conclusions should be interpreted as evidence of explanatory compression quality, not forecasting superiority.
+
+
+# Conclusions
+
+Dimensionality reduction is statistically justified in this dataset and remains economically meaningful when interpreted with discipline. Strong inter-factor co-movement implies that the effective dimensionality of FF5 is below five, which is consistent with PCA and MDS diagnostics reported earlier.
+
+Both PCA and MDS provide closely aligned 2D maps of factor geometry, while the first three PCs explain about `r round(sum(prop[1:3]) * 100, 1)`% of total variance. At the same time, the SMACOF stress level (`r round(mds_smacof$stress, 3)` in 2D) reminds us that two-dimensional projections still involve non-trivial distortion.
+
+At the portfolio-pricing layer (Chapter 9), PCA latent factors are practically effective but not a free lunch. The 3-factor PCA model retains on average `r round(model_compare_summary$mean_R2_retention * 100, 1)`% of FF5 \(R^2\), with a mean adjusted-\(R^2\) gap of `r round(model_compare_summary$mean_delta_adjR2, 4)`. In `r round(model_compare_summary$share_adjR2_within_95pct * 100, 1)`% of portfolios, PCA reaches at least 95% of FF5 adjusted \(R^2\), indicating that much of the explanatory content can be preserved after orthogonal compression.
+
+The methodological conclusion is therefore conditional: PCA is highly sensible as a compact explanatory layer for structure discovery, exposure mapping, and reduced-form risk analytics, while the original FF5 basis remains preferable when maximizing in-sample fit is the main objective. This framing balances efficiency, interpretability, and economic fidelity.
+
+# Reproducibility Appendix {-}
+
+```{r}
+pkg_versions <- tibble(
+  package = c("R", required_pkgs),
+  version = c(
+    as.character(getRversion()),
+    vapply(required_pkgs, function(p) as.character(packageVersion(p)), character(1))
+  )
+)
+
+knitr::kable(pkg_versions, caption = "R and package versions used in this run")
+sessionInfo()
+```
